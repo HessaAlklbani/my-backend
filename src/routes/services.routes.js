@@ -3,10 +3,26 @@ const router = express.Router();
 const pool = require("../config/db");
 const upload = require("../middleware/upload");
 
-const fs = require("fs");
-const path = require("path");
+async function safelyQueueFiles(filenames) {
+  try {
+    await upload.scheduleFileCleanup(filenames);
+  } catch (error) {
+    console.error("Could not queue stored file cleanup", error.code || error.name || "QUEUE_ERROR");
+    for (const filename of filenames || []) {
+      await upload.deleteIfUnreferenced(filename).catch((deleteError) => {
+        console.error("New unreferenced upload cleanup failed", deleteError.code || deleteError.name || "DELETE_FAILED");
+      });
+    }
+  }
+}
 
-
+async function processCleanupQueue() {
+  try {
+    await upload.processFileCleanupQueue();
+  } catch (error) {
+    console.error("Stored file cleanup remains queued", error.code || error.name || "QUEUE_ERROR");
+  }
+}
 
 // ================= CREATE SERVICE =================
 router.post("/", upload.single("image"), async (req, res) => {
@@ -20,6 +36,7 @@ router.post("/", upload.single("image"), async (req, res) => {
     );
     res.json({ service_id: result.insertId });
   } catch (err) {
+    if (image) await safelyQueueFiles([image]);
     console.error(err);
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -69,22 +86,45 @@ router.put("/:id", upload.single("image"), async (req, res) => {
   const { id } = req.params;
   const { name, description, duration, price } = req.body;
 
+  let connection;
+  let transactionStarted = false;
   try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+    transactionStarted = true;
     // جلب الصورة القديمة إذا ما تم رفع صورة جديدة
-    const [existing] = await pool.query("SELECT image FROM services WHERE id = ?", [id]);
-    if (existing.length === 0) return res.status(404).json({ message: "Service not found" });
+    const [existing] = await connection.query("SELECT image FROM services WHERE id = ? FOR UPDATE", [id]);
+    if (existing.length === 0) {
+      await upload.enqueueFileCleanup(connection, req.file ? [req.file.filename] : []);
+      await connection.commit();
+      transactionStarted = false;
+      await processCleanupQueue();
+      return res.status(404).json({ message: "Service not found" });
+    }
 
-    const fileToUse = req.file ? req.file.filename : existing[0].image;
+    const oldImage = existing[0].image;
+    const fileToUse = req.file ? req.file.filename : oldImage;
 
-    await pool.query(
+    await connection.query(
       "UPDATE services SET name = ?, description = ?, duration = ?, price = ?, image = ? WHERE id = ?",
       [name, description, duration, price, fileToUse, id]
     );
 
+    if (oldImage && oldImage !== fileToUse) {
+      await upload.enqueueFileCleanup(connection, [oldImage]);
+    }
+    await connection.commit();
+    transactionStarted = false;
+
+    await processCleanupQueue();
     res.json({ message: "Service updated successfully" });
   } catch (err) {
+    if (transactionStarted && connection) await connection.rollback();
+    if (req.file) await safelyQueueFiles([req.file.filename]);
     console.error(err);
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -92,21 +132,31 @@ router.put("/:id", upload.single("image"), async (req, res) => {
 router.delete("/:id", async (req, res) => {
   const { id } = req.params;
 
+  const connection = await pool.getConnection();
+  let transactionStarted = false;
   try {
     // حذف الصورة من uploads
-    const [existing] = await pool.query("SELECT image FROM services WHERE id = ?", [id]);
-    if (existing.length === 0) return res.status(404).json({ message: "Service not found" });
-
-    if (existing[0].image) {
-      const filePath = path.join(__dirname, "..", "uploads", existing[0].image);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    await connection.beginTransaction();
+    transactionStarted = true;
+    const [existing] = await connection.query("SELECT image FROM services WHERE id = ? FOR UPDATE", [id]);
+    if (existing.length === 0) {
+      await connection.rollback();
+      transactionStarted = false;
+      return res.status(404).json({ message: "Service not found" });
     }
 
-    await pool.query("DELETE FROM services WHERE id = ?", [id]);
+    await connection.query("DELETE FROM services WHERE id = ?", [id]);
+    await upload.enqueueFileCleanup(connection, [existing[0].image]);
+    await connection.commit();
+    transactionStarted = false;
+    await processCleanupQueue();
     res.json({ message: "Service deleted successfully" });
   } catch (err) {
+    if (transactionStarted) await connection.rollback();
     console.error(err);
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    connection.release();
   }
 });
 
